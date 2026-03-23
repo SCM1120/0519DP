@@ -1,226 +1,107 @@
 import streamlit as st
+from transformers import pipeline
+from PIL import Image
+import torch
 
-# 页面配置必须在最前面
-st.set_page_config(
-    page_title="智能广告文案生成器",
-    page_icon="📝",
-    layout="centered",
-)
+# --- 页面配置 ---
+st.set_page_config(page_title="ISOM5240 Retail AI Assistant", page_icon="🛍️", layout="wide")
 
-# 检查依赖是否安装
-try:
-    from PIL import Image
-    import torch
-    from transformers import (
-        BlipProcessor,
-        BlipForConditionalGeneration,
-        GPT2Tokenizer,
-        GPT2LMHeadModel,
-    )
-except ImportError as e:
-    st.error(f"❌ 缺少依赖包: {e}")
-    st.info("请确保 requirements.txt 已正确配置并重新部署")
-    st.stop()
+st.title("🛍️ Intelligent Retail Marketing Assistant (Pro Version)")
+st.write("Integrated multimodal automatic marketing system with Swin-Transformer, BLIP, and GPT-2.")
 
-import gc
+# --- 1. 加载模型 (Pipeline 集成) ---
+@st.cache_resource
+def load_pipelines():
+    # 1. 图像分类 (Swin-Tiny)
+    classifier = pipeline("image-classification", model="JescYip/Swin-Tiny")
+    
+    # 2. 图像描述 (BLIP)
+    captioner = pipeline("image-text-to-text", model="nlpconnect/vit-gpt2-image-captioning")
+    
+    # 3. 广告生成 (GPT-2)
+    ad_generator = pipeline("text-generation", model="SCM1120/gpt2-ad-finetuned")
 
-# CSS样式
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 1rem;
-    }
-    .sub-header {
-        font-size: 1.2rem;
-        color: #666;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .result-box {
-        background-color: #f0f2f6;
-        padding: 1.5rem;
-        border-radius: 10px;
-        margin-top: 1rem;
-    }
-    .caption-text {
-        font-size: 1.1rem;
-        color: #333;
-        font-style: italic;
-    }
-    .ad-text {
-        font-size: 1.2rem;
-        color: #1f77b4;
-        font-weight: 500;
-        line-height: 1.6;
-    }
-</style>
-""", unsafe_allow_html=True)
+    return classifier, captioner, ad_generator
+    
+with st.spinner('AI 引擎启动中...'):
+    v_classifier, v_captioner, t_generator = load_pipelines()
 
+# --- 2. 侧边栏与上传组件 ---
+with st.sidebar:
+    st.header("Upload Center")
+    uploaded_file = st.file_uploader("Select product image...", type=["jpg", "jpeg", "png"])
+    st.info("Recommendation: Use clean background e-commerce product images for best results.")
 
-@st.cache_resource(show_spinner=False)
-def load_blip_model():
-    """加载BLIP模型"""
-    device = "cpu"  # Streamlit Cloud 使用 CPU
-    try:
-        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-        model.eval()
-        return processor, model, device
-    except Exception as e:
-        st.error(f"加载 BLIP 模型失败: {e}")
-        raise
+# --- 3. 主交互逻辑 ---
+if uploaded_file is not None:
+    col1, col2 = st.columns([1, 1])
+    
+    image = Image.open(uploaded_file)
+    with col1:
+        st.image(image, caption='Product to be identified', use_container_width=True)
 
+    with col2:
+        st.subheader("Step 1: Deep Feature Extraction")
+        
+        # --- A. 运行 Swin-Tiny 分类 ---
+        with st.spinner('Swin-Tiny analyzing category...'):
+            cls_results = v_classifier(image)
+            top_label = cls_results[0]['label']
+            cls_confidence = cls_results[0]['score']
+        
+        # --- B. 运行 BLIP 生成描述 ---
+        with st.spinner('BLIP generating visual description...'):
+            cap_results = v_captioner(image, text="")
+            # 获取完整描述用于广告生成
+            full_description = cap_results[0]['generated_text']
+            keywords = ", ".join(full_description.split()[:10]) # 提取前10个词以提供更多上下文
 
-@st.cache_resource(show_spinner=False)
-def load_gpt2_model():
-    """加载GPT-2模型"""
-    device = "cpu"  # Streamlit Cloud 使用 CPU
-    try:
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
-        model = GPT2LMHeadModel.from_pretrained("gpt2")
-        model.eval()
-        return tokenizer, model, device
-    except Exception as e:
-        st.error(f"加载 GPT-2 模型失败: {e}")
-        raise
+        # 展示第一步结果
+        st.success(f"**Product Category**: {top_label}")
+        st.write(f"**Visual Description**: `{full_description}`")
+        st.caption(f"Classification Confidence: {cls_confidence:.2%}")
 
+        st.divider()
 
-def generate_caption(image, blip_processor, blip_model, device):
-    """使用BLIP生成图片标题"""
-    inputs = blip_processor(images=image, return_tensors="pt")
+        # --- 第二步：GPT-2 广告生成 ---
+        st.subheader("Step 2: Intelligent Copy Creation")
+        with st.spinner('GPT-2 crafting advertisement...'):
+            # 改进Prompt：使用更自然的语言，避免模板化
+            prompt = f"Imagine you're writing a catchy slogan for a {top_label} with these features: {full_description}. Create an exciting and persuasive ad copy that highlights the benefits and makes people want to buy it:"
+            
+            # 检查机制：如果广告太短，重新生成
+            ad_text = ""
+            min_words = 10  # 至少10个词
+            max_attempts = 5  # 最多尝试5次
+            attempts = 0
+            
+            while len(ad_text.split()) < min_words and attempts < max_attempts:
+                ad_results = t_generator(
+                    prompt,
+                    max_length=150,
+                    min_length=50,
+                    num_return_sequences=1,  # 每次生成一个
+                    truncation=True,
+                    temperature=0.8,
+                    pad_token_id=50256,
+                    do_sample=True,
+                    no_repeat_ngram_size=2
+                )
+                
+                ad_text = ad_results[0]['generated_text'].replace(prompt, "").strip()
+                # 移除常见的广告模板前缀和后缀
+                ad_text = ad_text.replace("Ad:", "").replace("#", "").strip()
+                attempts += 1
+            
+            if len(ad_text.split()) < min_words:
+                ad_text = "Sorry, unable to generate a sufficiently long advertisement. Please try a different image or adjust parameters."
 
-    with torch.no_grad():
-        output_ids = blip_model.generate(
-            **inputs,
-            max_new_tokens=30,
-            num_beams=2,
-            early_stopping=True
-        )
+        st.info(ad_text if ad_text else "Crafting in progress...")
 
-    caption = blip_processor.decode(output_ids[0], skip_special_tokens=True)
-    return caption
-
-
-def generate_ad(caption, gpt2_tokenizer, gpt2_model, device):
-    """使用GPT-2生成广告文案"""
-    prompt = f"Product: {caption}\nDescription: {caption}\nAd:"
-    inputs = gpt2_tokenizer(prompt, return_tensors="pt")
-
-    with torch.no_grad():
-        output_ids = gpt2_model.generate(
-            **inputs,
-            max_new_tokens=50,
-            do_sample=True,
-            temperature=0.8,
-            top_p=0.9,
-            pad_token_id=gpt2_tokenizer.eos_token_id,
-        )
-
-    full_text = gpt2_tokenizer.decode(output_ids[0], skip_special_tokens=True)
-
-    if "Ad:" in full_text:
-        ad = full_text.split("Ad:")[-1].strip().split("\n")[0]
-    else:
-        ad = full_text.strip()
-
-    return ad
-
-
-def main():
-    # 标题
-    st.markdown('<div class="main-header">📝 智能广告文案生成器</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">上传产品图片，AI自动生成吸引人的广告文案</div>', unsafe_allow_html=True)
-
-    # 初始化 session state
-    if 'models_loaded' not in st.session_state:
-        st.session_state.models_loaded = False
-
-    # 加载模型
-    if not st.session_state.models_loaded:
-        with st.spinner("⏳ 正在加载 AI 模型（首次需要下载，约1-2分钟）..."):
-            try:
-                blip_processor, blip_model, device1 = load_blip_model()
-                gpt2_tokenizer, gpt2_model, device2 = load_gpt2_model()
-                st.session_state.blip_processor = blip_processor
-                st.session_state.blip_model = blip_model
-                st.session_state.gpt2_tokenizer = gpt2_tokenizer
-                st.session_state.gpt2_model = gpt2_model
-                st.session_state.device = device1
-                st.session_state.models_loaded = True
-                st.success("✅ 模型加载完成！")
-            except Exception as e:
-                st.error(f"模型加载失败: {str(e)}")
-                st.stop()
-    else:
-        blip_processor = st.session_state.blip_processor
-        blip_model = st.session_state.blip_model
-        gpt2_tokenizer = st.session_state.gpt2_tokenizer
-        gpt2_model = st.session_state.gpt2_model
-        device = st.session_state.device
-
-    # 图片上传
-    uploaded_file = st.file_uploader(
-        "📤 上传产品图片",
-        type=["jpg", "jpeg", "png"],
-        help="支持 JPG、JPEG、PNG 格式，建议图片大小不超过 2MB"
-    )
-
-    if uploaded_file is not None:
-        try:
-            image = Image.open(uploaded_file).convert("RGB")
-            st.image(image, caption="上传的产品图片", use_container_width=True)
-
-            if st.button("🚀 生成广告文案", type="primary", use_container_width=True):
-                # 步骤1: 生成标题
-                with st.spinner("🔍 正在分析图片内容..."):
-                    caption = generate_caption(image, blip_processor, blip_model, device)
-
-                st.markdown("<div class='result-box'>", unsafe_allow_html=True)
-                st.markdown("**📝 产品描述：**")
-                st.markdown(f"<div class='caption-text'>\"{caption}\"</div>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-                # 步骤2: 生成广告文案
-                with st.spinner("✨ 正在创作广告文案..."):
-                    ad = generate_ad(caption, gpt2_tokenizer, gpt2_model, device)
-
-                st.markdown("<div class='result-box'>", unsafe_allow_html=True)
-                st.markdown("**📢 生成的广告文案：**")
-                st.markdown(f"<div class='ad-text'>\"{ad}\"</div>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-                # 复制按钮
-                st.code(ad, language="text")
-
-                # 清理内存
-                gc.collect()
-
-        except Exception as e:
-            st.error(f"处理图片时出错: {str(e)}")
-
-    # 使用说明
-    with st.expander("📖 使用说明"):
-        st.markdown("""
-        **工作流程：**
-        1. 📤 上传时尚产品图片（服装、配饰等）
-        2. 🔍 BLIP模型分析图片并生成产品描述
-        3. ✨ GPT-2模型基于描述生成吸引人的广告文案
-
-        **提示：**
-        - 建议使用清晰的产品图片
-        - 图片大小建议不超过 2MB
-        - 适用于时尚服饰类产品
+    # --- 4. 技术架构说明 (符合 ISOM5240 项目要求) ---
+    with st.expander("View Project Technical Architecture (Technical Pipeline Logic)"):
+        st.markdown(f"""
+        1.  **Swin-Tiny (Vision)**: Employs hierarchical Transformer architecture for precise 3-category classification of products (tops/bottoms/shoes).
+        2.  **BLIP (Visual-Language)**: Serves as Bridge, converting image features into unstructured visual descriptions.
+        3.  **GPT-2 (Generative AI)**: Receives `Category + Description` multidimensional input, generating e-commerce compliant marketing copy through autoregression.
         """)
-
-    # 页脚
-    st.markdown("---")
-    st.markdown("<div style='text-align: center; color: #999;'>Powered by BLIP + GPT-2</div>", unsafe_allow_html=True)
-
-
-if __name__ == "__main__":
-    main()
